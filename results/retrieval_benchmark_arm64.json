@@ -5,8 +5,8 @@
     "float_mem_mb": 15.4,
     "binary_mem_mb": 5.12,
     "mem_ratio_x": 3.0,
-    "float_search_ms": 2.26,
-    "binary_search_ms": 77.01,
+    "float_search_ms": 2.37,
+    "binary_search_ms": 77.85,
     "speedup_x": 0.0
   },
   "100000": {
@@ -14,8 +14,8 @@
     "float_mem_mb": 153.6,
     "binary_mem_mb": 51.2,
     "mem_ratio_x": 3.0,
-    "float_search_ms": 26.51,
-    "binary_search_ms": 778.78,
+    "float_search_ms": 26.25,
+    "binary_search_ms": 779.88,
     "speedup_x": 0.0
   },
   "1000000": {
@@ -23,8 +23,8 @@
     "float_mem_mb": 1536.0,
     "binary_mem_mb": 512.0,
     "mem_ratio_x": 3.0,
-    "float_search_ms": 243.83,
-    "binary_search_ms": 7787.33,
+    "float_search_ms": 245.72,
+    "binary_search_ms": 7786.61,
     "speedup_x": 0.0
   }
 }
