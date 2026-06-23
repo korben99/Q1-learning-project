@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# données et checkpoints (lourds, pas dans git)
+data_cache/
+checkpoints/*.pt
+*.log
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE
+.idea/
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/

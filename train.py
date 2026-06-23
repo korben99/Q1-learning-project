@@ -1,0 +1,153 @@
+"""
+Train float or native-binary embedding model on NLI triplets.
+
+Usage:
+  python train.py --mode float             # baseline float (384-dim)
+  python train.py --mode binary            # native binary  (4096-dim)
+  python train.py --mode float --max_samples 5000   # smoke test
+"""
+import argparse
+import time
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer
+from datasets import load_from_disk, load_dataset
+
+from models.float_embedder import FloatEmbedder, mnrl_loss
+from models.binary_embedder import BinaryEmbedder, binary_contrastive_loss
+
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data_cache"
+CKPT_DIR = BASE_DIR / "checkpoints"
+
+
+def get_device(prefer_mps=True):
+    if prefer_mps and torch.backends.mps.is_available():
+        print("Device: Apple MPS (Metal Performance Shaders)")
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        print("Device: CUDA")
+        return torch.device("cuda")
+    print("Device: CPU")
+    return torch.device("cpu")
+
+
+class NLIPairDataset(Dataset):
+    def __init__(self, ds):
+        self.anchors = ds["anchor"]
+        self.positives = ds["positive"]
+
+    def __len__(self):
+        return len(self.anchors)
+
+    def __getitem__(self, idx):
+        return self.anchors[idx], self.positives[idx]
+
+
+def tokenize(texts, tokenizer, device):
+    return tokenizer(
+        list(texts),
+        padding=True,
+        truncation=True,
+        max_length=128,
+        return_tensors="pt",
+    ).to(device)
+
+
+def train(mode, epochs=3, batch_size=64, lr=2e-5, max_samples=None, no_mps=False):
+    device = get_device(prefer_mps=not no_mps)
+
+    tokenizer = AutoTokenizer.from_pretrained("prajjwal1/bert-mini")
+
+    if mode == "float":
+        model = FloatEmbedder(output_dim=384).to(device)
+        ckpt_name = "float_embedder.pt"
+    else:
+        model = BinaryEmbedder(binary_dim=4096).to(device)
+        ckpt_name = "binary_embedder.pt"
+
+    # Load NLI dataset
+    cache = DATA_DIR / "nli_train"
+    if cache.exists():
+        ds = load_from_disk(str(cache))
+    else:
+        print("NLI cache not found, downloading...")
+        ds = load_dataset("sentence-transformers/all-nli", "triplet", split="train")
+
+    if max_samples:
+        ds = ds.select(range(min(max_samples, len(ds))))
+
+    loader = DataLoader(
+        NLIPairDataset(ds),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+    )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=len(loader) * epochs
+    )
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nMode: {mode} | Params: {n_params/1e6:.1f}M | "
+          f"Samples: {len(ds):,} | Epochs: {epochs} | Batch: {batch_size} | LR: {lr}")
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0.0
+        t0 = time.time()
+
+        for step, (anchors, positives) in enumerate(loader):
+            a_enc = tokenize(anchors, tokenizer, device)
+            p_enc = tokenize(positives, tokenizer, device)
+
+            if mode == "float":
+                a = model(**a_enc)
+                p = model(**p_enc)
+                loss = mnrl_loss(a, p)
+            else:
+                a_logits = model(**a_enc, binarize_output=False)
+                p_logits = model(**p_enc, binarize_output=False)
+                loss = binary_contrastive_loss(a_logits, p_logits)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+
+            epoch_loss += loss.item()
+
+            if step % 200 == 0:
+                elapsed = time.time() - t0
+                eta = elapsed / max(step + 1, 1) * (len(loader) - step - 1)
+                pct = (step + 1) / len(loader) * 100
+                print(
+                    f"  [{epoch+1}/{epochs}] step={step:>5}/{len(loader)} ({pct:.1f}%)"
+                    f"  loss={loss.item():.4f}  elapsed={elapsed:.0f}s  ETA={eta:.0f}s"
+                )
+
+        avg = epoch_loss / len(loader)
+        print(f"  Epoch {epoch+1} done — avg_loss={avg:.4f}  ({time.time()-t0:.0f}s)")
+
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    ckpt_path = CKPT_DIR / ckpt_name
+    torch.save(model.state_dict(), str(ckpt_path))
+    print(f"\nCheckpoint -> {ckpt_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["float", "binary"], required=True)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Limit training samples (smoke test)")
+    parser.add_argument("--no_mps", action="store_true",
+                        help="Force CPU even on Apple Silicon")
+    args = parser.parse_args()
+    train(args.mode, args.epochs, args.batch_size, args.lr, args.max_samples, args.no_mps)
