@@ -219,8 +219,9 @@ def main(binary_dims=(2048, 4096)):
 
     # ── Save ──
     RESULTS_DIR.mkdir(exist_ok=True)
+    from datetime import date
     slug = f"{machine.lower()}_{'faiss' if HAVE_FAISS else 'numpy'}"
-    out  = RESULTS_DIR / f"retrieval_benchmark_{slug}.json"
+    out  = RESULTS_DIR / f"retrieval_benchmark_{slug}_{date.today():%Y%m%d}.json"
     out.write_text(json.dumps(results, indent=2))
     print(f"\nResults -> {out}")
 

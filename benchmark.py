@@ -39,6 +39,32 @@ def hamming_sim_matrix(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.mm(a, b.T) / D
 
 
+# ── Bit diagnostics ───────────────────────────────────────────────────────────
+
+def bit_diagnostics(binary_vecs: np.ndarray) -> dict:
+    """binary_vecs: np.array (N, D), values in {-1, +1}"""
+    balance = (binary_vecs == 1).mean(axis=0)
+    p = balance
+    entropy = -p * np.log2(p + 1e-9) - (1 - p) * np.log2(1 - p + 1e-9)
+    dead_bits = ((balance < 0.05) | (balance > 0.95)).sum()
+    print(f"    Bits morts       : {dead_bits} / {binary_vecs.shape[1]}")
+    print(f"    Entropie moyenne : {entropy.mean():.3f}  (idéal 1.0)")
+    print(f"    Balance moyenne  : {balance.mean():.3f}  (idéal 0.5)")
+    return {"dead_bits": int(dead_bits), "entropy": float(entropy.mean()),
+            "balance": float(balance.mean())}
+
+
+def run_bit_diagnostics(model, tokenizer) -> dict:
+    """Encode STS-B test sentences and run bit-level statistics."""
+    from datasets import load_from_disk, load_dataset
+    cache = DATA_DIR / "sts_test"
+    ds = load_from_disk(str(cache)) if cache.exists() else \
+         load_dataset("mteb/stsbenchmark-sts", split="test")
+    texts = list(ds["sentence1"]) + list(ds["sentence2"])
+    vecs = model.encode(texts, tokenizer).numpy()
+    return bit_diagnostics(vecs)
+
+
 # ── STS-B ─────────────────────────────────────────────────────────────────────
 
 def eval_stsb(model, tokenizer, use_binary=False):
@@ -163,6 +189,37 @@ class PostHocBinaryWrapper:
         self.base.eval()
 
 
+# ── Q4 quantized float wrapper ────────────────────────────────────────────────
+
+class Q4FloatWrapper:
+    """
+    Float embedder with INT4 weight-only quantization (torchao).
+    Falls back to PyTorch INT8 dynamic quantization if torchao is unavailable.
+    Output is still float32 384-dim — index memory unchanged.
+    """
+    def __init__(self, base):
+        import copy
+        m = copy.deepcopy(base)
+        try:
+            from torchao.quantization import quantize_, Int4WeightOnlyConfig
+            quantize_(m, Int4WeightOnlyConfig())
+            self._backend = "torchao INT4"
+        except Exception as e:
+            print(f"  [Q4] torchao unavailable ({type(e).__name__}), using INT8 dynamic fallback")
+            m = copy.deepcopy(base)
+            m = torch.quantization.quantize_dynamic(m, {torch.nn.Linear}, dtype=torch.qint8)
+            self._backend = "INT8 dynamic (fallback)"
+        self.model = m
+        print(f"  [Q4] backend: {self._backend}")
+
+    def encode(self, texts, tokenizer, device="cpu", batch_size=64):
+        with torch.no_grad():
+            return self.model.encode(texts, tokenizer, device=device, batch_size=batch_size).float()
+
+    def eval(self):
+        self.model.eval()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(binary_dims=(2048, 4096)):
@@ -183,9 +240,14 @@ def main(binary_dims=(2048, 4096)):
 
     posthoc_model = PostHocBinaryWrapper(float_model)
 
+    print("  Applying Q4 quantization...")
+    q4_model = Q4FloatWrapper(float_model)
+    q4_model.eval()
+
     configs = [
-        ("float32_384",        float_model,   False, 384,  False),
-        ("binary_posthoc_384", posthoc_model, True,  384,  True),
+        ("float32_384",        float_model,   False, 384, False),
+        ("float32_q4_384",     q4_model,      False, 384, False),
+        ("binary_posthoc_384", posthoc_model, True,  384, True),
     ]
 
     for dim in binary_dims:
@@ -217,20 +279,29 @@ def main(binary_dims=(2048, 4096)):
         print("  CPU latency (batch=32, 100 runs)...")
         lat = benchmark_latency(model, tokenizer)
 
+        bit_diag = None
+        if is_binary:
+            print("  Bit diagnostics...")
+            bit_diag = run_bit_diagnostics(model, tokenizer)
+
+        dtype = "binary" if is_binary else ("float32_q4" if "q4" in name else "float32")
         results[name] = {
             "dims": dim,
-            "dtype": "binary" if is_binary else "float32",
+            "dtype": dtype,
             "stsb_spearman": round(stsb, 4),
             "scifact_recall10": round(scifact, 4) if scifact is not None else None,
             "memory_1k_vecs": memory_per_1k(dim, is_binary),
             "latency_cpu": lat,
+            "bit_diagnostics": bit_diag,
+            **({"q4_backend": model._backend} if hasattr(model, "_backend") else {}),
         }
 
         r10 = f"{scifact:.4f}" if scifact is not None else "N/A"
         print(f"  STS-B={stsb:.4f}  R@10={r10}  lat={lat['mean_ms']}ms")
 
     RESULTS_DIR.mkdir(exist_ok=True)
-    out = RESULTS_DIR / "benchmark_results.json"
+    from datetime import date
+    out = RESULTS_DIR / f"benchmark_results_{date.today():%Y%m%d}.json"
     out.write_text(json.dumps(results, indent=2))
     print(f"\nResults -> {out}")
 
@@ -246,6 +317,18 @@ def main(binary_dims=(2048, 4096)):
             f"{r['memory_1k_vecs']:>10} {r['latency_cpu']['mean_ms']:>9.1f}ms"
         )
     print("=" * 90)
+
+    # Bit diagnostics table (binary models only)
+    binary_results = {n: r for n, r in results.items() if r["bit_diagnostics"]}
+    if binary_results:
+        print("\n" + "=" * 70)
+        print(f"{'Model':<25} {'Dims':>6} {'Dead bits':>12} {'Entropy':>10} {'Balance':>10}")
+        print("-" * 70)
+        for name, r in binary_results.items():
+            d = r["bit_diagnostics"]
+            print(f"{name:<25} {r['dims']:>6} {d['dead_bits']:>12} {d['entropy']:>10.3f} {d['balance']:>10.3f}")
+        print("=" * 70)
+        print("  ideal: dead_bits=0, entropy=1.000, balance=0.500")
 
 
 if __name__ == "__main__":
