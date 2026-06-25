@@ -82,22 +82,41 @@ No dead bits. `|r| max ≈ 0.94` means some bit pairs are nearly perfectly corre
 
 ## Retrieval at scale
 
-Intel Core Ultra 7 155H · FAISS `IndexBinaryFlat` (AVX2 + POPCNT) vs `IndexFlatIP`  
-16 queries · top-10 · averaged over 10 runs
+Intel Core Ultra 7 155H · 16 queries · top-10 · averaged over 10 runs  
+All methods are **exact search** — no approximation, no recall degradation.
 
-| Scale | Float (ms) | Bin-1024 (ms) | Bin-2048 (ms) | 1024 vs Float | 2048 vs Float |
-|---|---|---|---|---|---|
-| 10k | 45.9 | 1.2 | 2.1 | **37.3×** | **22.1×** |
-| 100k | 258.9 | 12.1 | 27.3 | **21.4×** | **9.5×** |
-| **1M** | **4 516** | **96** | **190** | **47.1×** | **23.8×** |
+### Competitive landscape
 
-| Model | Memory @ 1M vecs | vs Float |
-|---|---|---|
-| Float 384 | 1 536 MB | — |
-| Binary 1024 | 128 MB | **12× smaller** |
-| Binary 2048 | 256 MB | **6× smaller** |
+| Method | FAISS index | Exact? | bytes/vec | Speed @ 1M |
+|---|---|---|---|---|
+| Float32 | `IndexFlatIP` | ✓ | 1 536 | 4 516 ms |
+| **Float INT8** | `IndexScalarQuantizer QT_8bit` | **✓** | **384** | **TBD** |
+| **Binary 1024** | `IndexBinaryFlat` (POPCNT) | **✓** | **128** | **96 ms** |
+| **Binary 2048** | `IndexBinaryFlat` (POPCNT) | **✓** | **256** | **190 ms** |
+| Float IVF-PQ | `IndexIVFPQ` | ✗ approx. | variable | faster but lossy |
 
-> **Note:** float uses `IndexFlatIP` (cosine) and binary uses `IndexBinaryFlat` (Hamming) — different metrics, but timings are comparable for measuring ranking latency at scale.
+> **IVF-PQ is not benchmarked here.** It is an *approximate* method — it trades recall for speed using product quantization codebooks. Comparing it to exact binary search would be misleading: any speedup comes at the cost of missing relevant results, not from a more efficient kernel. The meaningful comparison is exact vs exact.
+
+> `QT_8bit` uses asymmetric distance computation (query in float32, stored vectors in INT8) — still exact. Run `python benchmark_faiss.py --binary_dims 1024 2048` to fill in the INT8 column above.
+
+### Speed results (exact search only)
+
+| Scale | Float32 (ms) | Float INT8 (ms) | Bin-1024 (ms) | Bin-2048 (ms) | 1024 vs f32 | 2048 vs f32 |
+|---|---|---|---|---|---|---|
+| 10k | 45.9 | TBD | 1.2 | 2.1 | **37×** | **22×** |
+| 100k | 258.9 | TBD | 12.1 | 27.3 | **21×** | **10×** |
+| **1M** | **4 516** | **TBD** | **96** | **190** | **47×** | **24×** |
+
+### Memory @ 1M vectors
+
+| Model | Index size | vs Float32 | vs Float INT8 |
+|---|---|---|---|
+| Float32 384-dim | 1 536 MB | — | — |
+| Float INT8 384-dim | 384 MB | 4× smaller | — |
+| **Binary 1024** | **128 MB** | **12× smaller** | **3× smaller** |
+| **Binary 2048** | **256 MB** | **6× smaller** | 1.5× smaller |
+
+> `IndexFlatIP` (cosine) and `IndexBinaryFlat` (Hamming) are different metrics, but timings are comparable for measuring ranking latency at scale.
 
 ### Why POPCNT changes everything
 

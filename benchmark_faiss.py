@@ -66,6 +66,26 @@ def float_search(queries: np.ndarray, db: np.ndarray, k: int = 10) -> np.ndarray
         return np.argpartition(-(q @ d.T), k, axis=1)[:, :k]
 
 
+def float_int8_search(queries: np.ndarray, db: np.ndarray, k: int = 10) -> np.ndarray:
+    """
+    Exact search on INT8-quantized float vectors (FAISS IndexScalarQuantizer QT_8bit).
+    Stores 1 byte/dim instead of 4 → index 4× smaller, faster due to reduced memory bandwidth.
+    Search is still exact: FAISS uses asymmetric distance (query in float, db in INT8).
+    NumPy fallback not implemented — skip on ARM64.
+    """
+    if not HAVE_FAISS:
+        return None
+    q, d = queries.copy().astype(np.float32), db.copy().astype(np.float32)
+    faiss.normalize_L2(q); faiss.normalize_L2(d)
+    idx = faiss.IndexScalarQuantizer(
+        FLOAT_DIM, faiss.ScalarQuantizer.QT_8bit, faiss.METRIC_INNER_PRODUCT
+    )
+    idx.train(d)
+    idx.add(d)
+    _, I = idx.search(q, k)
+    return I
+
+
 def binary_search(q_packed: np.ndarray, db_packed: np.ndarray,
                   binary_dim: int, k: int = 10) -> np.ndarray:
     if HAVE_FAISS:
@@ -200,15 +220,29 @@ def main(checkpoints=("2048", "4096")):
     for n in scales:
         print(f"\n{'='*60}  N={n:,}")
 
-        float_mem = n * FLOAT_DIM * 4 / 1e6
-        float_corpus = make_float_corpus(float_seeds, n)
-        float_ms = bench(float_search, float_seeds, float_corpus, 10)
-        print(f"  float-{FLOAT_DIM:4d}: {float_ms:8.2f} ms  |  {float_mem:6.0f} MB")
+        float_corpus  = make_float_corpus(float_seeds, n)
+        float_mem     = n * FLOAT_DIM * 4 / 1e6
+        float_int8_mem = n * FLOAT_DIM * 1 / 1e6
 
-        scale_r = {"n_vectors": n,
-                   "float_mem_mb": round(float_mem, 1),
-                   "float_search_ms": round(float_ms, 2),
-                   "binary": {}}
+        float_ms = bench(float_search, float_seeds, float_corpus, 10)
+        print(f"  float32  {FLOAT_DIM:4d}d: {float_ms:8.2f} ms  |  {float_mem:6.0f} MB")
+
+        float_int8_ms = None
+        if HAVE_FAISS:
+            float_int8_ms = bench(float_int8_search, float_seeds, float_corpus, 10)
+            vs_int8 = vs_str(float_ms, float_int8_ms)
+            int8_vs_float_mem = float_mem / float_int8_mem
+            print(f"  float INT8 {FLOAT_DIM:3d}d: {float_int8_ms:8.2f} ms  |  {float_int8_mem:6.0f} MB  =>  {vs_int8}  ({int8_vs_float_mem:.0f}x smaller index)")
+
+        scale_r = {
+            "n_vectors":           n,
+            "float_mem_mb":        round(float_mem, 1),
+            "float_search_ms":     round(float_ms, 2),
+            "float_int8_mem_mb":   round(float_int8_mem, 1),
+            "float_int8_search_ms": round(float_int8_ms, 2) if float_int8_ms else None,
+            "float_int8_vs_float": vs_str(float_ms, float_int8_ms) if float_int8_ms else None,
+            "binary": {},
+        }
 
         for suffix, (dim, seeds_f, seeds_p) in bin_seeds.items():
             binary_bytes  = dim // 8
@@ -216,14 +250,17 @@ def main(checkpoints=("2048", "4096")):
             binary_corpus = make_binary_corpus(seeds_p, n)
             binary_ms     = bench(binary_search, seeds_p, binary_corpus, dim, 10)
             vs            = vs_str(float_ms, binary_ms)
+            vs_int8       = vs_str(float_int8_ms, binary_ms) if float_int8_ms else None
             mem_ratio     = float_mem / binary_mem
-            print(f"  bin-{suffix:<12}: {binary_ms:8.2f} ms  |  {binary_mem:6.0f} MB  =>  {vs}  ({mem_ratio:.0f}x smaller)")
+            print(f"  bin-{suffix:<12}: {binary_ms:8.2f} ms  |  {binary_mem:6.0f} MB  =>  {vs} vs float32  ({mem_ratio:.0f}x smaller)")
             scale_r["binary"][suffix] = {
-                "dim":              dim,
-                "binary_mem_mb":    round(binary_mem, 1),
-                "mem_ratio_x":      round(mem_ratio, 1),
-                "binary_search_ms": round(binary_ms, 2),
-                "vs_float":         vs,
+                "dim":                  dim,
+                "binary_mem_mb":        round(binary_mem, 1),
+                "mem_ratio_vs_float32": round(mem_ratio, 1),
+                "mem_ratio_vs_int8":    round(float_int8_mem / binary_mem, 1),
+                "binary_search_ms":     round(binary_ms, 2),
+                "vs_float32":           vs,
+                "vs_float_int8":        vs_int8,
             }
 
         results[str(n)] = scale_r
@@ -238,29 +275,37 @@ def main(checkpoints=("2048", "4096")):
 
     # ── Summary table ──
     suffixes = list(bin_seeds.keys())
-    W = 13
-    sep = "=" * (12 + (W + 2) * (1 + 2 * len(suffixes)))
+    W   = 13
+    has_int8 = HAVE_FAISS
+    n_float_cols = 2 if has_int8 else 1
+    sep = "=" * (12 + (W + 2) * (n_float_cols + 2 * len(suffixes)))
     print(f"\n{sep}")
     print(f"  {backend}")
-    header = f"{'Scale':>12}"
-    header += f"  {'Float (ms)':>{W}}"
+    header = f"{'Scale':>12}  {'Float32 (ms)':>{W}}"
+    if has_int8:
+        header += f"  {'Float INT8 (ms)':>{W}}"
     for s in suffixes:
         header += f"  {f'Bin-{s} (ms)':>{W}}"
     for s in suffixes:
-        header += f"  {f'vs Float ({s})':>{W}}"
+        header += f"  {f'vs f32 ({s})':>{W}}"
     print(header)
-    print("-" * (12 + (W + 2) * (1 + 2 * len(suffixes))))
+    print("-" * (12 + (W + 2) * (n_float_cols + 2 * len(suffixes))))
     for n_str, r in results.items():
         if not n_str.isdigit():
             continue
         row = f"{r['n_vectors']:>12,}  {r['float_search_ms']:>{W}.2f}"
+        if has_int8 and r.get("float_int8_search_ms"):
+            row += f"  {r['float_int8_search_ms']:>{W}.2f}"
         for s in suffixes:
             row += f"  {r['binary'][s]['binary_search_ms']:>{W}.2f}"
         for s in suffixes:
-            row += f"  {r['binary'][s]['vs_float']:>{W}}"
+            row += f"  {r['binary'][s]['vs_float32']:>{W}}"
         print(row)
     print(sep)
 
+    if has_int8:
+        print("\n  Float INT8: FAISS IndexScalarQuantizer QT_8bit — exact search, 4× smaller index than float32.")
+        print("  IVF-PQ (not benchmarked): approximate search — trades recall for speed, not a fair comparison.")
     if not HAVE_FAISS:
         print("\n[!] NumPy backend — faiss-cpu on x86/Python ≤3.12 uses AVX2+POPCNT.")
 
