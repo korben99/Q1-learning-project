@@ -13,14 +13,18 @@ Hardware: Mac Mini M4 Pro + Intel Core Ultra 7 155H, **CPU only — no GPU invol
 
 **Train binary. Don't binarize float.**
 
-Native binary embeddings score **+24% Recall@10** over post-hoc binarization, validated across 5 random seeds. The 2048-dim model retrieves from 1M vectors in **190ms** (24× faster than float, index 6× smaller). The 1024-dim model hits **47× faster** with a 12× smaller index at a non-significant quality cost (p=0.159).
+Native binary embeddings score **+24% Recall@10** over post-hoc binarization, validated across 5 random seeds. The 1024-dim model is **37–49× faster than float INT8** and **20–47× faster than float32** at 1M vectors, with a 12× smaller index — all on CPU, no GPU.
 
 | Model | Dims | R@10 (5 seeds) | Memory/1k | FAISS @ 1M |
 |---|---|---|---|---|
-| Float32 baseline | 384 | 0.313 | 1.46 MB | 4 516 ms |
+| Float32 baseline | 384 | 0.313 | 1.46 MB | 1 800–4 500 ms¹ |
+| Float INT8 exact | 384 | 0.313 | 384 KB | 2 700–4 700 ms (**slower than f32**²) |
 | Post-hoc binary | 384 | 0.236 | 47 KB | — |
-| **Native binary** | **2048** | **0.293 ±0.010** | **250 KB** | **190 ms (24×)** |
-| Native binary | 1024 | 0.276 ±0.012 | 125 KB | 96 ms (47×) |
+| **Native binary 2048** | **2048** | **0.293 ±0.010** | **250 KB** | **145–200 ms** |
+| **Native binary 1024** | **1024** | **0.276 ±0.012** | **125 KB** | **73–102 ms** |
+
+> ¹ Float32 is memory-bandwidth bound (1.5 GB index at 1M) — highly sensitive to OS background load. Binary fits in L3 cache and is compute-bound (POPCNT), so it stays fast regardless.  
+> ² INT8 index is 4× smaller but retrieval is consistently slower: FAISS QT_8bit dequantization overhead outweighs the cache benefit. Binary POPCNT is the only method that is simultaneously smaller **and** faster.
 
 Pick 2048 for quality, 1024 for maximum throughput. The difference between them is not statistically significant (p=0.159).
 
@@ -89,23 +93,28 @@ All methods are **exact search** — no approximation, no recall degradation.
 
 | Method | FAISS index | Exact? | bytes/vec | Speed @ 1M |
 |---|---|---|---|---|
-| Float32 | `IndexFlatIP` | ✓ | 1 536 | 4 516 ms |
-| **Float INT8** | `IndexScalarQuantizer QT_8bit` | **✓** | **384** | **TBD** |
-| **Binary 1024** | `IndexBinaryFlat` (POPCNT) | **✓** | **128** | **96 ms** |
-| **Binary 2048** | `IndexBinaryFlat` (POPCNT) | **✓** | **256** | **190 ms** |
-| Float IVF-PQ | `IndexIVFPQ` | ✗ approx. | variable | faster but lossy |
+| Float32 | `IndexFlatIP` | ✓ | 1 536 | 3 815 ms |
+| Float INT8 | `IndexScalarQuantizer QT_8bit` | ✓ | 384 | 4 719 ms (**slower**) |
+| **Binary 1024** | `IndexBinaryFlat` (POPCNT) | **✓** | **128** | **102 ms** |
+| **Binary 2048** | `IndexBinaryFlat` (POPCNT) | **✓** | **256** | **202 ms** |
+| Float IVF-PQ | `IndexIVFPQ` | ✗ **approx.** | variable | — |
 
-> **IVF-PQ is not benchmarked here.** It is an *approximate* method — it trades recall for speed using product quantization codebooks. Comparing it to exact binary search would be misleading: any speedup comes at the cost of missing relevant results, not from a more efficient kernel. The meaningful comparison is exact vs exact.
+**Float INT8 is slower than float32.** FAISS `QT_8bit` uses asymmetric distance computation (query in float32, stored vectors in INT8). The dequantization overhead exceeds the cache benefit at this scale — FAISS's optimized BLAS float32 path wins. Binary POPCNT is the only method that is both **smaller** and **faster**.
 
-> `QT_8bit` uses asymmetric distance computation (query in float32, stored vectors in INT8) — still exact. Run `python benchmark_faiss.py --binary_dims 1024 2048` to fill in the INT8 column above.
+**IVF-PQ is not benchmarked here.** It is an *approximate* method that trades recall for speed via product quantization codebooks. Comparing it to exact binary search would be misleading: any speedup comes at the cost of missing relevant results, not from a more efficient kernel. The meaningful comparison is exact vs exact.
 
-### Speed results (exact search only)
+### Speed (exact search only)
 
-| Scale | Float32 (ms) | Float INT8 (ms) | Bin-1024 (ms) | Bin-2048 (ms) | 1024 vs f32 | 2048 vs f32 |
+Intel Core Ultra 7 155H · FAISS AVX2+POPCNT · 16 queries · top-10 · 10 runs averaged  
+Float32 and INT8 times vary with system load (memory-bound). Binary is stable (compute-bound, fits in L3 cache).
+
+| Scale | Float32 (ms) | Float INT8 (ms) | Bin-1024 (ms) | Bin-2048 (ms) | 1024 vs f32 | 1024 vs INT8 |
 |---|---|---|---|---|---|---|
-| 10k | 45.9 | TBD | 1.2 | 2.1 | **37×** | **22×** |
-| 100k | 258.9 | TBD | 12.1 | 27.3 | **21×** | **10×** |
-| **1M** | **4 516** | **TBD** | **96** | **190** | **47×** | **24×** |
+| 10k | 16–50 | 29–58 | 0.7–1.5 | 1.3–2.4 | 23–33× | **19–40×** |
+| 100k | 200–270 | 290–430 | 7–10 | 14–26 | 24–30× | **29–46×** |
+| **1M** | **1 800–4 500** | **2 700–4 700** | **73–102** | **145–202** | **24–47×** | **37–49×** |
+
+The vs-INT8 ratio is the more stable reference: binary systematically wins whether the machine is idle or loaded.
 
 ### Memory @ 1M vectors
 
